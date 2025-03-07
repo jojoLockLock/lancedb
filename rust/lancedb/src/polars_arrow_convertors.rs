@@ -1,132 +1,113 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright The LanceDB Authors
+#[cfg(test)]
+mod test_polars_arrow_convertors {
+    use super::*;
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::DataType as ArrowDataType;
+    use arrow::record_batch::RecordBatch;
+    use polars::prelude::{DataType as PolarsDType, Field as PolarField, Schema as PolarSchema};
 
-/// Polars and LanceDB both use Arrow for their in memory-representation, but use
-/// different Rust Arrow implementations. LanceDB uses the arrow-rs crate and
-/// Polars uses the polars-arrow crate.
-///
-/// This crate defines zero-copy conversions (of the underlying buffers)
-/// between polars-arrow and arrow-rs using the C FFI.
-///
-/// The polars-arrow does implement conversions to and from arrow-rs, but
-/// requires a feature flagged dependency on arrow-rs. The version of arrow-rs
-/// depended on by polars-arrow and LanceDB may not be compatible,
-/// which necessitates using the C FFI.
-use crate::error::Result;
-use polars::prelude::{DataFrame, Series};
-use std::{mem, sync::Arc};
+    #[test]
+    fn test_convert_polars_df_schema_to_arrow_rb_schema() {
+        let mut polars_schema = PolarSchema::new();
+        polars_schema.with_column("id".into(), PolarsDType::Int32);
+        polars_schema.with_column("name".into(), PolarsDType::Utf8);
 
-/// When interpreting Polars dataframes as polars-arrow record batches,
-/// one must decide whether to use Arrow string/binary view types
-/// instead of the standard Arrow string/binary types.
-/// For now, we will not use string view types because conversions
-/// for string view types from polars-arrow to arrow-rs are not yet implemented.
-/// See: https://lists.apache.org/thread/w88tpz76ox8h3rxkjl4so6rg3f1rv7wt for the
-/// differences in the types.
-pub const POLARS_ARROW_FLAVOR: bool = false;
-const IS_ARRAY_NULLABLE: bool = true;
+        let arrow_schema = convert_polars_df_schema_to_arrow_rb_schema(polars_schema).unwrap();
 
-/// Converts a Polars DataFrame schema to an Arrow RecordBatch schema.
-pub fn convert_polars_df_schema_to_arrow_rb_schema(
-    polars_df_schema: polars::prelude::Schema,
-) -> Result<Arc<arrow_schema::Schema>> {
-    let arrow_fields: Result<Vec<arrow_schema::Field>> = polars_df_schema
-        .into_iter()
-        .map(|(name, df_dtype)| {
-            let polars_arrow_dtype = df_dtype.to_arrow(POLARS_ARROW_FLAVOR);
-            let polars_field =
-                polars_arrow::datatypes::Field::new(name, polars_arrow_dtype, IS_ARRAY_NULLABLE);
-            convert_polars_arrow_field_to_arrow_rs_field(polars_field)
-        })
-        .collect();
-    Ok(Arc::new(arrow_schema::Schema::new(arrow_fields?)))
-}
-
-/// Converts an Arrow RecordBatch schema to a Polars DataFrame schema.
-pub fn convert_arrow_rb_schema_to_polars_df_schema(
-    arrow_schema: &arrow_schema::Schema,
-) -> Result<polars::prelude::Schema> {
-    let polars_df_fields: Result<Vec<polars::prelude::Field>> = arrow_schema
-        .fields()
-        .iter()
-        .map(|arrow_rs_field| {
-            let polars_arrow_field = convert_arrow_rs_field_to_polars_arrow_field(arrow_rs_field)?;
-            Ok(polars::prelude::Field::new(
-                arrow_rs_field.name(),
-                polars::datatypes::DataType::from(polars_arrow_field.data_type()),
-            ))
-        })
-        .collect();
-    Ok(polars::prelude::Schema::from_iter(polars_df_fields?))
-}
-
-/// Converts an Arrow RecordBatch to a Polars DataFrame, using a provided Polars DataFrame schema.
-pub fn convert_arrow_rb_to_polars_df(
-    arrow_rb: &arrow::record_batch::RecordBatch,
-    polars_schema: &polars::prelude::Schema,
-) -> Result<DataFrame> {
-    let mut columns: Vec<Series> = Vec::with_capacity(arrow_rb.num_columns());
-
-    for (i, column) in arrow_rb.columns().iter().enumerate() {
-        let polars_df_dtype = polars_schema.try_get_at_index(i)?.1;
-        let polars_arrow_dtype = polars_df_dtype.to_arrow(POLARS_ARROW_FLAVOR);
-        let polars_array =
-            convert_arrow_rs_array_to_polars_arrow_array(column, polars_arrow_dtype)?;
-        columns.push(Series::from_arrow(
-            polars_schema.try_get_at_index(i)?.0,
-            polars_array,
-        )?);
+        assert_eq!(arrow_schema.fields().len(), 2);
+        assert_eq!(arrow_schema.field(0).name(), "id");
+        assert_eq!(arrow_schema.field(0).data_type(), &ArrowDataType::Int32);
+        assert_eq!(arrow_schema.field(1).name(), "name");
+        assert_eq!(arrow_schema.field(1).data_type(), &ArrowDataType::Utf8);
     }
 
-    Ok(DataFrame::from_iter(columns))
-}
+    #[test]
+    fn test_convert_arrow_rb_schema_to_polars_df_schema() {
+        let arrow_fields = vec![
+            arrow_schema::Field::new("id", ArrowDataType::Int32, true),
+            arrow_schema::Field::new("name", ArrowDataType::Utf8, true),
+        ];
+        let arrow_schema = arrow_schema::Schema::new(arrow_fields);
 
-/// Converts a polars-arrow Arrow array to an arrow-rs Arrow array.
-pub fn convert_polars_arrow_array_to_arrow_rs_array(
-    polars_array: Box<dyn polars_arrow::array::Array>,
-    arrow_datatype: arrow_schema::DataType,
-) -> std::result::Result<arrow_array::ArrayRef, arrow_schema::ArrowError> {
-    let polars_c_array = polars_arrow::ffi::export_array_to_c(polars_array);
-    // Safety: `polars_arrow::ffi::ArrowArray` has the same memory layout as `arrow::ffi::FFI_ArrowArray`.
-    let arrow_c_array: arrow_data::ffi::FFI_ArrowArray = unsafe { mem::transmute(polars_c_array) };
-    Ok(arrow_array::make_array(unsafe {
-        arrow::ffi::from_ffi_and_data_type(arrow_c_array, arrow_datatype)
-    }?))
-}
+        let polars_schema = convert_arrow_rb_schema_to_polars_df_schema(&arrow_schema).unwrap();
 
-/// Converts an arrow-rs Arrow array to a polars-arrow Arrow array.
-fn convert_arrow_rs_array_to_polars_arrow_array(
-    arrow_rs_array: &Arc<dyn arrow_array::Array>,
-    polars_arrow_dtype: polars::datatypes::ArrowDataType,
-) -> Result<Box<dyn polars_arrow::array::Array>> {
-    let arrow_c_array = arrow::ffi::FFI_ArrowArray::new(&arrow_rs_array.to_data());
-    // Safety: `polars_arrow::ffi::ArrowArray` has the same memory layout as `arrow::ffi::FFI_ArrowArray`.
-    let polars_c_array: polars_arrow::ffi::ArrowArray = unsafe { mem::transmute(arrow_c_array) };
-    Ok(unsafe { polars_arrow::ffi::import_array_from_c(polars_c_array, polars_arrow_dtype) }?)
-}
+        assert_eq!(polars_schema.len(), 2);
+        assert_eq!(polars_schema.get_field_by_name("id").unwrap().data_type(), &PolarsDType::Int32);
+        assert_eq!(polars_schema.get_field_by_name("name").unwrap().data_type(), &PolarsDType::Utf8);
+    }
 
-fn convert_polars_arrow_field_to_arrow_rs_field(
-    polars_arrow_field: polars_arrow::datatypes::Field,
-) -> Result<arrow_schema::Field> {
-    let polars_c_schema = polars_arrow::ffi::export_field_to_c(&polars_arrow_field);
-    // Safety: `polars_arrow::ffi::ArrowSchema` has the same memory layout as `arrow::ffi::FFI_ArrowSchema`.
-    let arrow_c_schema: arrow::ffi::FFI_ArrowSchema =
-        unsafe { mem::transmute::<_, _>(polars_c_schema) };
-    let arrow_rs_dtype = arrow_schema::DataType::try_from(&arrow_c_schema)?;
-    Ok(arrow_schema::Field::new(
-        polars_arrow_field.name,
-        arrow_rs_dtype,
-        IS_ARRAY_NULLABLE,
-    ))
-}
+    #[test]
+    fn test_convert_arrow_rb_to_polars_df() {
+        let id_array = Int32Array::from(vec![1, 2, 3]);
+        let name_array = StringArray::from(vec!["a", "b", "c"]);
 
-fn convert_arrow_rs_field_to_polars_arrow_field(
-    arrow_rs_field: &arrow_schema::Field,
-) -> Result<polars_arrow::datatypes::Field> {
-    let arrow_rs_dtype = arrow_rs_field.data_type();
-    let arrow_c_schema = arrow::ffi::FFI_ArrowSchema::try_from(arrow_rs_dtype)?;
-    // Safety: `polars_arrow::ffi::ArrowSchema` has the same memory layout as `arrow::ffi::FFI_ArrowSchema`.
-    let polars_c_schema: polars_arrow::ffi::ArrowSchema =
-        unsafe { mem::transmute::<_, _>(arrow_c_schema) };
-    Ok(unsafe { polars_arrow::ffi::import_field_from_c(&polars_c_schema) }?)
+        let schema = arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", ArrowDataType::Int32, true),
+            arrow_schema::Field::new("name", ArrowDataType::Utf8, true),
+        ]);
+
+        let record_batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(id_array), Arc::new(name_array)],
+        ).unwrap();
+
+        let mut polars_schema = PolarSchema::new();
+        polars_schema.with_column("id".into(), PolarsDType::Int32);
+        polars_schema.with_column("name".into(), PolarsDType::Utf8);
+
+        let df = convert_arrow_rb_to_polars_df(&record_batch, &polars_schema).unwrap();
+
+        assert_eq!(df.shape(), (3, 2));
+        assert_eq!(df.schema().len(), 2);
+    }
+
+    #[test]
+    fn test_convert_polars_arrow_array_to_arrow_rs_array() {
+        let polars_array = polars_arrow::array::Int32Array::from_slice(&[1, 2, 3]);
+        let arrow_array = convert_polars_arrow_array_to_arrow_rs_array(
+            Box::new(polars_array),
+            ArrowDataType::Int32,
+        ).unwrap();
+
+        assert_eq!(arrow_array.len(), 3);
+        assert_eq!(arrow_array.data_type(), &ArrowDataType::Int32);
+    }
+
+    #[test]
+    fn test_convert_arrow_rs_array_to_polars_arrow_array() {
+        let arrow_array = Arc::new(Int32Array::from(vec![1, 2, 3])) as Arc<dyn arrow_array::Array>;
+        let polars_array = convert_arrow_rs_array_to_polars_arrow_array(
+            &arrow_array,
+            polars::datatypes::ArrowDataType::Int32,
+        ).unwrap();
+
+        assert_eq!(polars_array.len(), 3);
+        assert_eq!(polars_array.data_type(), &polars::datatypes::ArrowDataType::Int32);
+    }
+
+    #[test]
+    fn test_convert_polars_arrow_field_to_arrow_rs_field() {
+        let polars_field = polars_arrow::datatypes::Field::new(
+            "test",
+            polars::datatypes::ArrowDataType::Int32,
+            true,
+        );
+
+        let arrow_field = convert_polars_arrow_field_to_arrow_rs_field(polars_field).unwrap();
+
+        assert_eq!(arrow_field.name(), "test");
+        assert_eq!(arrow_field.data_type(), &ArrowDataType::Int32);
+        assert!(arrow_field.is_nullable());
+    }
+
+    #[test]
+    fn test_convert_arrow_rs_field_to_polars_arrow_field() {
+        let arrow_field = arrow_schema::Field::new("test", ArrowDataType::Int32, true);
+
+        let polars_field = convert_arrow_rs_field_to_polars_arrow_field(&arrow_field).unwrap();
+
+        assert_eq!(polars_field.name, "test");
+        assert_eq!(polars_field.data_type(), &polars::datatypes::ArrowDataType::Int32);
+        assert!(polars_field.is_nullable);
+    }
 }
